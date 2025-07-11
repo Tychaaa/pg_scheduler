@@ -1,0 +1,6 @@
+# файл scheduler.control
+
+comment = 'Background-task scheduler extension'
+default_version = '1.0'
+module_pathname = '$libdir/scheduler'
+relocatable = false
