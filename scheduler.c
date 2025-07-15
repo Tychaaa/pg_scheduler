@@ -241,6 +241,7 @@ execute_job(int32 job_id, const char *command)
 static void
 launcher_tick(void)
 {
+    /*------------------ 1. открыть транзакцию и SPI ------------------*/
     StartTransactionCommand();
 
     if (SPI_connect() != SPI_OK_CONNECT)
@@ -248,51 +249,66 @@ launcher_tick(void)
 
     PushActiveSnapshot(GetTransactionSnapshot());
 
-    /* выбрать все job’ы, которые пора запускать */
+    /*------------------ 2. выбрать просроченные job’ы ----------------*/
     const char *sql_sel =
-        "SELECT job_id, command, schedule "
+        "SELECT job_id, command, schedule, is_shell "
         "FROM   scheduler.jobs "
         "WHERE  next_run <= clock_timestamp() "
         "FOR UPDATE SKIP LOCKED";
 
     if (SPI_execute(sql_sel, false, 0) != SPI_OK_SELECT)
-        elog(ERROR, "scheduler: SELECT failed");
+        elog(ERROR, "scheduler: SELECT jobs failed");
 
+    /*------------------ 3. перебрать результаты ----------------------*/
     for (uint64 i = 0; i < SPI_processed; i++)
     {
         HeapTuple tup  = SPI_tuptable->vals[i];
         TupleDesc desc = SPI_tuptable->tupdesc;
         bool      isnull;
 
-        int32 job_id   = DatumGetInt32(SPI_getbinval(tup, desc, 1, &isnull));
-        char *command  = TextDatumGetCString(SPI_getbinval(tup, desc, 2, &isnull));
+        int32 job_id  = DatumGetInt32(SPI_getbinval(tup, desc, 1, &isnull));
+        char *command = TextDatumGetCString(SPI_getbinval(tup, desc, 2, &isnull));
 
-        /* schedule (поле 3) — может быть NULL для one-shot */
-        Datum sch_datum = SPI_getbinval(tup, desc, 3, &isnull);
-        char *cron      = isnull ? NULL : TextDatumGetCString(sch_datum);
-        bool  oneshot   = isnull;
+        /* schedule может быть NULL для one-shot */
+        Datum sched_datum = SPI_getbinval(tup, desc, 3, &isnull);
+        bool  oneshot     = isnull;
+        char *cron        = oneshot ? NULL : TextDatumGetCString(sched_datum);
 
-        /* --- выполняем job в под-транзакции ------------------------ */
+        bool  is_shell   = DatumGetBool(SPI_getbinval(tup, desc, 4, &isnull));
+
+        /*------------ 3.1 выполнить команду в под-транзакции ----------*/
         PG_TRY();
         {
             BeginInternalSubTransaction(NULL);
-            SPI_execute(command, false, 0);      /* выполняем SQL-команду */
+
+            if (is_shell)
+            {
+                /* shell-команда через system() */
+                int rc = system(command);
+                (void) rc;   /* минимальный MVP — код возврата пока игнорируем */
+            }
+            else
+            {
+                /* SQL-команда через SPI */
+                SPI_execute(command, false, 0);
+            }
+
             ReleaseCurrentSubTransaction();
         }
         PG_CATCH();
         {
             RollbackAndReleaseCurrentSubTransaction();
-            FlushErrorState();                   /* фиксируем failure, но идём дальше */
+            FlushErrorState();   /* не падаем, идём к следующему job */
         }
         PG_END_TRY();
 
-        /* --- post-processing --------------------------------------- */
+        /*------------ 3.2 post-processing -----------------------------*/
         if (oneshot)
         {
-            /* одноразовое: удаляем запись */
-            Oid   at[1] = {INT4OID};
-            Datum vl[1] = {Int32GetDatum(job_id)};
-            char  nl[1] = {' '};
+            /* одноразовое: удалить строку */
+            Oid   at[1]  = {INT4OID};
+            Datum vl[1]  = {Int32GetDatum(job_id)};
+            char  nl[1]  = {' '};
 
             SPI_execute_with_args(
                 "DELETE FROM scheduler.jobs WHERE job_id = $1",
@@ -300,13 +316,13 @@ launcher_tick(void)
         }
         else
         {
-            /* повторное: пересчитываем next_run */
+            /* повторяющееся: пересчитать next_run */
             TimestampTz next = parse_next_run(cron);
 
-            Oid   at[2] = {INT4OID, TIMESTAMPTZOID};
-            Datum vl[2] = {Int32GetDatum(job_id),
-                           TimestampTzGetDatum(next)};
-            char  nl[2] = {' ',' '};
+            Oid   at[2]  = {INT4OID, TIMESTAMPTZOID};
+            Datum vl[2]  = {Int32GetDatum(job_id),
+                            TimestampTzGetDatum(next)};
+            char  nl[2]  = {' ',' '};
 
             SPI_execute_with_args(
                 "UPDATE scheduler.jobs "
@@ -317,6 +333,7 @@ launcher_tick(void)
         }
     }
 
+    /*------------------ 4. закрыть SPI и транзакцию ------------------*/
     PopActiveSnapshot();
     SPI_finish();
     CommitTransactionCommand();
@@ -357,42 +374,36 @@ PG_FUNCTION_INFO_V1(scheduler_schedule);
 Datum
 scheduler_schedule(PG_FUNCTION_ARGS)
 {
-    text *cron_txt = PG_GETARG_TEXT_PP(0);
-    text *cmd_txt  = PG_GETARG_TEXT_PP(1);
-
-    char *cron = text_to_cstring(cron_txt);
-    char *cmd  = text_to_cstring(cmd_txt);
+    const char *cron   = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    text       *cmdtxt = PG_GETARG_TEXT_PP(1);
+    bool  is_shell     = (PG_NARGS() >= 3) ? PG_GETARG_BOOL(2) : false;
 
     TimestampTz next = parse_next_run(cron);
 
-    Oid   argt[3]   = {TEXTOID, TEXTOID, TIMESTAMPTZOID};
-    Datum vals[3]   = {CStringGetTextDatum(cron),
-                       CStringGetTextDatum(cmd),
-                       TimestampTzGetDatum(next)};
-    bool  nulls[3]  = {false,false,false};
+    Oid   argt[4]  = {TEXTOID, TEXTOID, TIMESTAMPTZOID, BOOLOID};
+    Datum vals[4]  = {CStringGetTextDatum(cron),
+                      PointerGetDatum(cmdtxt),
+                      TimestampTzGetDatum(next),
+                      BoolGetDatum(is_shell)};
+    char  nulls[4] = {' ',' ',' ',' '};
 
-    int   spi_rc;
-    int32 job_id   = -1;
-
-    /* открываем SPI-сессию внутри УЖЕ начатой транзакции */
-    if ((spi_rc = SPI_connect()) != SPI_OK_CONNECT)
+    int spi_rc = SPI_connect();
+    if (spi_rc != SPI_OK_CONNECT)
         elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(spi_rc));
 
     spi_rc = SPI_execute_with_args(
-        "INSERT INTO scheduler.jobs(schedule, command, next_run)"
-        "VALUES($1,$2,$3) RETURNING job_id",
-        3, argt, vals, nulls, false, 0);
+        "INSERT INTO scheduler.jobs(schedule, command, next_run, is_shell) "
+        "VALUES($1,$2,$3,$4) RETURNING job_id",
+        4, argt, vals, nulls, false, 0);
 
     if (spi_rc != SPI_OK_INSERT_RETURNING)
-        elog(ERROR, "unable to insert job: %s", SPI_result_code_string(spi_rc));
+        elog(ERROR, "scheduler_schedule: INSERT failed");
 
     bool isnull;
-    job_id = DatumGetInt32(
-                 SPI_getbinval(SPI_tuptable->vals[0],
-                               SPI_tuptable->tupdesc, 1, &isnull));
-
+    int  job_id = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
+                                              SPI_tuptable->tupdesc, 1,
+                                              &isnull));
     SPI_finish();
-
     PG_RETURN_INT32(job_id);
 }
 
@@ -405,41 +416,44 @@ PG_FUNCTION_INFO_V1(scheduler_schedule_once);
 Datum
 scheduler_schedule_once(PG_FUNCTION_ARGS)
 {
+    /* -------- 1. аргументы ---------------------------------------- */
     Interval *delay    = PG_GETARG_INTERVAL_P(0);
     text     *cmd_txt  = PG_GETARG_TEXT_PP(1);
+    bool      is_shell = (PG_NARGS() >= 3) ? PG_GETARG_BOOL(2) : false;
 
-    /* вычисляем целевой момент: now() + delay */
-    TimestampTz next_run =
-        DatumGetTimestampTz(
-            DirectFunctionCall2(timestamptz_pl_interval,
-                                TimestampTzGetDatum(GetCurrentTimestamp()),
-                                PG_GETARG_DATUM(0)));
+    /* -------- 2. вычисляем момент запуска ------------------------- */
+    TimestampTz next_run = DatumGetTimestampTz(
+                               DirectFunctionCall2(timestamptz_pl_interval,
+                                                   TimestampTzGetDatum(GetCurrentTimestamp()),
+                                                   PointerGetDatum(delay)));
 
-    Oid   argt[2]  = {TEXTOID, TIMESTAMPTZOID};
-    Datum vals[2]  = {PointerGetDatum(cmd_txt),
-                      TimestampTzGetDatum(next_run)};
-    bool  nulls[2] = {false,false};
+    /* -------- 3. вставляем строку через SPI ----------------------- */
+    Oid   argt[3]  = {TEXTOID, TIMESTAMPTZOID, BOOLOID};
+    Datum vals[3]  = {PointerGetDatum(cmd_txt),
+                      TimestampTzGetDatum(next_run),
+                      BoolGetDatum(is_shell)};
+    char  nulls[3] = {' ',' ',' '};
 
-    int   spi_rc, job_id = -1;
+    if (SPI_connect() != SPI_OK_CONNECT)
+        elog(ERROR, "scheduler_schedule_once: SPI_connect failed");
 
-    if ((spi_rc = SPI_connect()) != SPI_OK_CONNECT)
-        elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(spi_rc));
-
-    spi_rc = SPI_execute_with_args(
-        "INSERT INTO scheduler.jobs(schedule, command, next_run) "
-        "VALUES(NULL, $1, $2) RETURNING job_id",
-        2, argt, vals, nulls, false, 0);
+    int spi_rc = SPI_execute_with_args(
+        "INSERT INTO scheduler.jobs(schedule, command, next_run, is_shell) "
+        "VALUES(NULL, $1, $2, $3) "
+        "RETURNING job_id",
+        3, argt, vals, nulls, false, 0);
 
     if (spi_rc != SPI_OK_INSERT_RETURNING)
-        elog(ERROR, "unable to insert one-shot job: %s",
+        elog(ERROR, "scheduler_schedule_once: INSERT failed (%s)",
              SPI_result_code_string(spi_rc));
 
     bool isnull;
-    job_id = DatumGetInt32(
-                 SPI_getbinval(SPI_tuptable->vals[0],
-                               SPI_tuptable->tupdesc, 1, &isnull));
+    int32 job_id = DatumGetInt32(
+                       SPI_getbinval(SPI_tuptable->vals[0],
+                                     SPI_tuptable->tupdesc, 1, &isnull));
 
     SPI_finish();
+
     PG_RETURN_INT32(job_id);
 }
 
