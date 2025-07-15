@@ -1,61 +1,59 @@
 /* contrib/scheduler/scheduler--1.0.sql */
 
--- Если кто-то попытается запустить скрипт напрямую через \i
+-- Если кто-то попытается запустить скрипт напрямую, напомним, что нужно использовать CREATE EXTENSION
 \echo Use "CREATE EXTENSION scheduler" to load this file. \quit
 
--- схема для изоляции элементов шедулера
+-- Создание схемы для хранения объектов расширения
 CREATE SCHEMA IF NOT EXISTS scheduler;
 
--- тип команды: SQL или shell
-CREATE TYPE scheduler.command_type AS ENUM ('sql', 'shell');
+-- Установка search_path: сначала искать объекты в схеме scheduler, потом в public
+SET search_path = scheduler, public;
 
--- основная таблица заданий
+-- Основная таблица со списком заданий (jobs)
 CREATE TABLE scheduler.jobs (
-    job_id        BIGSERIAL PRIMARY KEY,
-    job_name      TEXT            NOT NULL UNIQUE,
-    enabled       BOOLEAN         NOT NULL DEFAULT true,
-    command_type  scheduler.command_type NOT NULL,
-    command       TEXT            NOT NULL,
-    schedule_cron TEXT            NULL,
-    schedule_intv INTERVAL        NULL,
-    next_run      TIMESTAMPTZ     NOT NULL DEFAULT now()
+    job_id       serial       PRIMARY KEY,                              -- Уникальный ID задания
+    schedule     text,                                                  -- Формат расписания (NULL для one-shot)
+    command      text         NOT NULL,                                 -- Команда или SQL-запрос для выполнения
+    owner        regrole      NOT NULL DEFAULT current_user::regrole,   -- Владелец задания
+    next_run     timestamptz,                                           -- Следующее время запуска
+    last_run     timestamptz,                                           -- Последнее время запуска
+    last_status  text                                                   -- Последний статус выполнения
 );
 
--- функция создания задания
-CREATE FUNCTION scheduler.create_job(
-    p_job_name      TEXT,
-    p_command_type  scheduler.command_type,
-    p_command       TEXT,
-    p_schedule_cron TEXT    DEFAULT NULL,
-    p_schedule_intv INTERVAL DEFAULT NULL
-) RETURNS BIGINT
-LANGUAGE sql AS $$
-    -- вставляем строку и возвращаем job_id
-    INSERT INTO scheduler.jobs(job_name, command_type, command, schedule_cron, schedule_intv, next_run)
-    VALUES (p_job_name, p_command_type, p_command, p_schedule_cron, p_schedule_intv,
-        CASE
-          WHEN p_schedule_cron IS NOT NULL THEN now()
-          WHEN p_schedule_intv IS NOT NULL THEN now() + p_schedule_intv
-          ELSE now()
-        END
-    )
-    RETURNING job_id;
-$$;
+-- Лог выполнения заданий
+CREATE TABLE scheduler.job_run_log (
+    run_id     bigserial     PRIMARY KEY,
+    job_id     int           REFERENCES scheduler.jobs ON DELETE CASCADE,
+    started_at timestamptz   NOT NULL DEFAULT clock_timestamp(),
+    finished_at timestamptz,
+    success    bool,
+    message    text
+);
 
--- функция выключения задания
-CREATE FUNCTION scheduler.disable_job(p_job_id BIGINT) RETURNS VOID
-LANGUAGE sql AS $$
-    UPDATE scheduler.jobs SET enabled = false WHERE job_id = p_job_id;
-$$;
+-- Функция добавления нового задания (C-функция в scheduler.so)
+CREATE FUNCTION scheduler.schedule(_cron text, _cmd text)
+RETURNS int
+LANGUAGE C STRICT PARALLEL SAFE AS 'MODULE_PATHNAME', 'scheduler_schedule';
 
--- функция включения задания
-CREATE FUNCTION scheduler.enable_job(p_job_id BIGINT) RETURNS VOID
-LANGUAGE sql AS $$
-    UPDATE scheduler.jobs SET enabled = true WHERE job_id = p_job_id;
-$$;
+CREATE FUNCTION scheduler.schedule_once(delay interval, cmd text)
+RETURNS int
+LANGUAGE C STRICT PARALLEL SAFE AS 'MODULE_PATHNAME', 'scheduler_schedule_once';
 
--- функция удаления задания
-CREATE FUNCTION scheduler.drop_job(p_job_id BIGINT) RETURNS VOID
-LANGUAGE sql AS $$
-    DELETE FROM scheduler.jobs WHERE job_id = p_job_id;
-$$;
+-- Функция удаления задания по ID
+CREATE FUNCTION scheduler.unschedule(_job int)
+RETURNS void
+LANGUAGE C STRICT PARALLEL SAFE AS 'MODULE_PATHNAME', 'scheduler_unschedule';
+
+-- Функция немедленного выполнения задания по ID
+CREATE FUNCTION scheduler.run_now(_job int)
+RETURNS void
+LANGUAGE C STRICT PARALLEL SAFE AS 'MODULE_PATHNAME', 'scheduler_run_now';
+
+-- Разрешение на выполнение этих функций для всех пользователей
+GRANT EXECUTE ON FUNCTION scheduler.schedule(text,text)             TO public;
+GRANT EXECUTE ON FUNCTION scheduler.schedule_once(interval, text)   TO public;
+GRANT EXECUTE ON FUNCTION scheduler.unschedule(int)                 TO public;
+GRANT EXECUTE ON FUNCTION scheduler.run_now(int)                    TO public;
+
+-- Комментарий для всей схемы
+COMMENT ON SCHEMA scheduler IS 'Light‑weight built‑in job scheduler';
