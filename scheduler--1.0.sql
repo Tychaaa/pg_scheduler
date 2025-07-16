@@ -30,12 +30,12 @@ CREATE TABLE scheduler.jobs (
 
 -- Журнал запусков
 CREATE TABLE scheduler.job_run_log (
-    run_id       bigserial    PRIMARY KEY,
-    job_id       int          REFERENCES scheduler.jobs ON DELETE CASCADE,
-    started_at   timestamptz  NOT NULL DEFAULT clock_timestamp(),
-    finished_at  timestamptz,
-    success      bool,
-    message      text
+    run_id       bigserial    PRIMARY KEY,                                  -- уникальный ID запуска (журнальный)
+    job_id       int          REFERENCES scheduler.jobs ON DELETE CASCADE,  -- ссылка на задание (при удалении job — удаляются и его логи)
+    started_at   timestamptz  NOT NULL DEFAULT clock_timestamp(),           -- время начала выполнения
+    finished_at  timestamptz,                                               -- время завершения (может быть NULL при сбое)
+    success      bool,                                                      -- флаг: успешно ли выполнено
+    message      text                                                       -- сообщение: OK, ошибка или статус shell-команды
 );
 
 /*------------------------------------------------------------
